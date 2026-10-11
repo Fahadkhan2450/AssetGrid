@@ -1,28 +1,46 @@
-# Company Instrument Management System
+# AssetGrid
 
-Internal enterprise system for equipment/inventory, loan requests, issue/return workflow, Excel import/export, real-time notifications, audit history, locations and reports.
+### Enterprise Instrument & Asset Management System
 
-## Stack
-- Frontend: React + TypeScript + Vite
-- Backend: Node.js + Express + TypeScript + Mongoose
-- Database: MongoDB replica set (local Docker setup)
-- Real-time: Socket.IO
-- Excel: SheetJS (`xlsx`)
-- Authentication: JWT + bcrypt
+AssetGrid is an internal enterprise platform for managing company equipment, instrument inventory, loan requests, issuance and returns, locations, Excel imports/exports, real-time notifications, audit history, and reports.
 
-## Requirements
-- Node.js 20+
-- Docker Desktop / Docker Engine
-- npm
+## Technology Stack
 
-## Run MongoDB
+* **Frontend:** React, TypeScript, Vite
+* **Backend:** Node.js, Express.js, TypeScript
+* **Database:** MongoDB with a single-node replica set
+* **ODM:** Mongoose
+* **Real-Time Communication:** Socket.IO
+* **Excel Processing:** SheetJS (`xlsx`)
+* **Authentication:** JWT and bcrypt
+* **Deployment Support:** Docker Compose
+
+## Prerequisites
+
+* Node.js 20 or later
+* npm
+* Docker Desktop or Docker Engine
+* Git
+
+## Installation and Setup
+
+### 1. Clone the Repository
+
+```bash
+git clone https://github.com/Fahadkhan2450/AssetGrid.git
+cd AssetGrid
+```
+
+### 2. Start MongoDB
+
 ```bash
 docker compose -f deploy/docker-compose.yml up -d
 ```
 
-The compose file runs MongoDB as a single-node replica set (`rs0`) so multi-document transactions work.
+MongoDB runs as a single-node replica set named `rs0`, enabling multi-document transactions.
 
-## Run backend
+### 3. Configure and Start the Backend
+
 ```bash
 cd backend
 cp .env.example .env
@@ -30,50 +48,105 @@ npm install
 npm run seed
 npm run dev
 ```
-Backend: http://localhost:4000
 
-## Run frontend
+Backend URL: `http://localhost:4000`
+
+Configure the environment variables in `.env` before starting the application. Use a secure JWT secret for non-development environments.
+
+### 4. Start the Frontend
+
+Open a new terminal from the project root:
+
 ```bash
 cd frontend
 npm install
 npm run dev
 ```
-Frontend: http://localhost:5173
 
-## Demo accounts
-- Admin: `admin@example.com` / `Admin123!`
-- Employee: `employee@example.com` / `Employee123!`
+Frontend URL: `http://localhost:5173`
 
-## Excel import templates
-Administration -> Excel Import supports:
-- Equipment: `equipmentCode,name,serialNumber,model,locationCode,customerCode,status`
-- Members: `memberCode,name,email,department,employeeId`
-- Customers: `customerCode,name`
-- Locations: `code,name,address`
+## Demo Accounts
 
-Imports are validated, logged, and upserted by unique business code. Excel is not the system of record; MongoDB is.
+If the seed script creates these demo accounts, use the following credentials:
 
-## Main workflow
-1. Admin imports or creates members, customers, locations and equipment.
-2. Employee creates a loan request using only members/customers/equipment present in MongoDB.
-3. Backend writes request + admin notifications + audit entry.
-4. Socket.IO tells the Admin dashboard immediately.
-5. Admin opens the Issue Instrument card; requester/customer/request data is pre-filled.
-6. Admin chooses available equipment and confirms expected return date.
-7. Backend runs one MongoDB transaction that creates the loan, changes equipment to `ON_LOAN`, changes request to `ISSUED`, writes loan history/audit, and creates the employee notification.
-8. Employee receives the status in real time.
-9. Admin marks the instrument returned; the transaction changes the loan/request/equipment and history, then notifies the employee.
+| Role     | Email                  | Password       |
+| -------- | ---------------------- | -------------- |
+| Admin    | `admin@example.com`    | `Admin123!`    |
+| Employee | `employee@example.com` | `Employee123!` |
 
-## Production notes
-- Replace demo JWT secret.
-- Use company SSO/Active Directory where available.
-- Put the app behind HTTPS/reverse proxy.
-- Disable development index auto-creation and create indexes during deployment.
-- Use company-controlled MongoDB and file storage/backup.
-- Restrict database access to the backend server.
+**Security:** Demo credentials are for local development only. Replace or disable them before deployment.
 
-## Real-time behavior
-Socket.IO is attached to the same Node.js server. After the backend successfully changes MongoDB, it emits `dashboard:changed` and targeted `notification:new` events. The frontend refreshes the relevant data from MongoDB through the API instead of trying to maintain an independent copy of counts.
+## Core Features
 
-## Security rule
-Frontend controls are only UX. Authorization is enforced in the backend for approve, reject, issue, return, Excel import and administration routes.
+* **Equipment Inventory:** Manage instrument records, equipment status, serial numbers, models, and locations.
+* **Loan Management:** Submit, review, approve or reject requests, issue instruments, and record returns.
+* **Department-Based Access:** Enforce permissions and authorization through backend validation.
+* **Excel Import and Export:** Import supported business records and export inventory and reports.
+* **Real-Time Notifications:** Receive relevant updates through Socket.IO.
+* **Audit History:** Maintain records of important actions and workflow changes.
+* **Location Management:** Organize equipment by registered locations.
+* **Dashboard and Reports:** Track equipment availability, active loans, pending requests, and operational activity.
+* **Transaction-Safe Workflows:** Keep related database updates consistent using MongoDB transactions.
+
+## Excel Import Templates
+
+The Administration section supports importing the following data using the specified column names.
+
+| Data Type | Required Template Columns                                                |
+| --------- | ------------------------------------------------------------------------ |
+| Equipment | `equipmentCode,name,serialNumber,model,locationCode,customerCode,status` |
+| Members   | `memberCode,name,email,department,employeeId`                            |
+| Customers | `customerCode,name`                                                      |
+| Locations | `code,name,address`                                                      |
+
+Imports are validated, logged, and upserted using unique business codes. MongoDB remains the system of record; Excel files are used for data exchange and reporting.
+
+## Main Workflow
+
+1. Administrators create or import members, customers, locations, and equipment.
+2. Employees submit loan requests using records available in MongoDB.
+3. The backend saves the request, creates relevant notifications, and records an audit entry.
+4. Socket.IO notifies the administrator dashboard of changes.
+5. The administrator reviews the request and opens the instrument issuance workflow.
+6. Request and customer details are pre-filled, and the administrator selects available equipment and an expected return date.
+7. The backend processes issuance in a MongoDB transaction, updating the loan, equipment status, request status, history, audit records, and employee notification.
+8. Employees receive status updates through real-time notifications.
+9. When equipment is returned, the backend updates the relevant loan, request, equipment status, history, and notifications transactionally.
+
+## Real-Time Architecture
+
+Socket.IO runs on the same Node.js server as the backend API.
+
+After successful database changes, the backend emits `dashboard:changed` and targeted `notification:new` events. The frontend retrieves updated records through the API, keeping MongoDB as the source of truth rather than maintaining a separate, independent copy of operational data.
+
+## Security
+
+AssetGrid enforces authorization in the backend. Frontend controls improve usability but are not treated as security boundaries.
+
+Recommended production measures:
+
+* Replace development JWT secrets with strong, securely managed secrets.
+* Integrate company SSO or Active Directory where available.
+* Use HTTPS behind a properly configured reverse proxy.
+* Restrict database access to authorized backend services.
+* Disable development index auto-creation and manage indexes during deployment.
+* Use company-controlled database storage, backups, and recovery procedures.
+* Protect administrative, import, issue, return, and other privileged API routes with server-side authorization.
+* Remove demo credentials and avoid committing `.env` files or other secrets to Git.
+
+## Project Structure
+
+```text
+AssetGrid/
+├── backend/
+├── frontend/
+├── deploy/
+│   └── docker-compose.yml
+└── README.md
+```
+
+## Purpose
+
+AssetGrid provides a centralized approach to company instrument and equipment management, improving asset visibility, accountability, workflow consistency, and operational reporting.
+
+**AssetGrid — One Platform. Complete Asset Visibility.**
