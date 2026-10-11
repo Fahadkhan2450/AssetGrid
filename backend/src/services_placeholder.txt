@@ -1,0 +1,1 @@
+Service logic is organized inside modules. Add a dedicated service layer per module when the business rules expand.

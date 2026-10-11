@@ -1,0 +1,3714 @@
+import { Router } from 'express';
+import { z } from 'zod';
+
+import {
+  requireAuth,
+  requireAdmin,
+  AuthRequest,
+} from '../../middleware/auth.js';
+
+import { Member } from '../../models/Member.js';
+import { Customer } from '../../models/Customer.js';
+import { Equipment } from '../../models/Equipment.js';
+import { LoanRequest } from '../../models/LoanRequest.js';
+import { Loan } from '../../models/Loan.js';
+import { LoanHistory } from '../../models/LoanHistory.js';
+import { Notification } from '../../models/Notification.js';
+import { User } from '../../models/User.js';
+
+import { audit } from '../../utils/audit.js';
+import { nextNumber } from '../../utils/sequence.js';
+import { sendEmail } from '../../utils/email.js';
+
+import {
+  emitDashboardChanged,
+  emitUserNotification,
+} from '../../websocket/socket.js';
+
+const router = Router();
+
+/*
+|--------------------------------------------------------------------------
+| ROLE HELPERS
+|--------------------------------------------------------------------------
+*/
+
+/**
+ * Read the admin type from MongoDB instead of trusting a value from the
+ * client/JWT. This makes the approval/issue separation authoritative.
+ */
+async function getAdminType(
+  req: AuthRequest
+): Promise<'APPROVER' | 'ISSUER' | null> {
+  if (!req.user || req.user.role !== 'ADMIN') {
+    return null;
+  }
+
+  const user = await User.findById(
+    req.user.id
+  )
+    .select('role adminType isActive')
+    .lean();
+
+  if (
+    !user ||
+    user.role !== 'ADMIN' ||
+    user.isActive !== true
+  ) {
+    return null;
+  }
+
+  if (
+    user.adminType !== 'APPROVER' &&
+    user.adminType !== 'ISSUER'
+  ) {
+    return null;
+  }
+
+  return user.adminType;
+}
+
+/*
+|--------------------------------------------------------------------------
+| EMAIL HELPERS
+|--------------------------------------------------------------------------
+*/
+
+/**
+ * Format a date for emails.
+ */
+function formatDate(
+  value: Date | string | null | undefined
+): string {
+  if (!value) {
+    return '—';
+  }
+
+  const date =
+    value instanceof Date
+      ? value
+      : new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return '—';
+  }
+
+  return date.toLocaleDateString(
+    'en-GB',
+    {
+      day: '2-digit',
+      month: 'short',
+      year: 'numeric',
+    }
+  );
+}
+
+/**
+ * Safely get equipment display name.
+ */
+function getEquipmentName(
+  equipment: any
+): string {
+  return (
+    equipment?.material ||
+    equipment?.model ||
+    'Equipment'
+  );
+}
+
+/**
+ * Send an individual loan-related email.
+ *
+ * Email errors are intentionally caught so that
+ * an SMTP problem does not cancel the database operation.
+ */
+async function sendLoanEmail(
+  options: {
+    to?: string | null;
+    subject: string;
+    title: string;
+    greetingName?: string;
+    message: string;
+    details?: Array<{
+      label: string;
+      value: string;
+    }>;
+  }
+): Promise<void> {
+  if (!options.to?.trim()) {
+    console.warn(
+      `No email address available for "${options.subject}".`
+    );
+
+    return;
+  }
+
+  const detailRows =
+    options.details || [];
+
+  const detailsText =
+    detailRows.length > 0
+      ? `\n\n${detailRows
+          .map(
+            (item) =>
+              `${item.label}: ${item.value}`
+          )
+          .join('\n')}`
+      : '';
+
+  const text = [
+    `Hello ${
+      options.greetingName?.trim() ||
+      'there'
+    },`,
+    '',
+    options.message,
+    detailsText,
+    '',
+    'Company Instrument Management System',
+  ].join('\n');
+
+  const htmlDetails =
+    detailRows.length > 0
+      ? `
+        <table
+          style="
+            border-collapse: collapse;
+            width: 100%;
+            max-width: 650px;
+            margin-top: 20px;
+          "
+        >
+          ${detailRows
+            .map(
+              (item) => `
+                <tr>
+                  <td
+                    style="
+                      border: 1px solid #ddd;
+                      padding: 9px;
+                      font-weight: 600;
+                    "
+                  >
+                    ${item.label}
+                  </td>
+                  <td
+                    style="
+                      border: 1px solid #ddd;
+                      padding: 9px;
+                    "
+                  >
+                    ${item.value}
+                  </td>
+                </tr>
+              `
+            )
+            .join('')}
+        </table>
+      `
+      : '';
+
+  const html = `
+    <div
+      style="
+        font-family: Arial, Helvetica, sans-serif;
+        color: #222;
+        line-height: 1.6;
+      "
+    >
+      <h2
+        style="
+          margin-bottom: 16px;
+        "
+      >
+        ${options.title}
+      </h2>
+
+      <p>
+        Hello ${
+          options.greetingName?.trim() ||
+          'there'
+        },
+      </p>
+
+      <p>
+        ${options.message}
+      </p>
+
+      ${htmlDetails}
+
+      <p
+        style="
+          margin-top: 24px;
+          color: #666;
+        "
+      >
+        Company Instrument Management System
+      </p>
+    </div>
+  `;
+
+  await sendEmail({
+    to: options.to.trim(),
+    subject: options.subject,
+    text,
+    html,
+  });
+}
+
+/*
+|--------------------------------------------------------------------------
+| GET ALL LOAN REQUESTS
+|--------------------------------------------------------------------------
+*/
+
+router.get(
+  '/requests',
+  requireAuth,
+  async (req: AuthRequest, res) => {
+    try {
+      if (!req.user) {
+        return res.status(401).json({
+          message:
+            'Authentication required',
+        });
+      }
+
+      const filter =
+        req.user.role === 'ADMIN'
+          ? {}
+          : {
+              requesterId:
+                req.user.id,
+            };
+
+      const requests =
+        await LoanRequest.find(filter)
+          .sort({
+            createdAt: -1,
+          })
+          .lean();
+
+      return res.json(requests);
+    } catch (error) {
+      console.error(
+        'Get loan requests error:',
+        error
+      );
+
+      return res.status(500).json({
+        message:
+          'Could not load loan requests',
+      });
+    }
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| GET ALL LOANS
+|--------------------------------------------------------------------------
+*/
+
+router.get(
+  '/',
+  requireAuth,
+  async (req: AuthRequest, res) => {
+    try {
+      if (!req.user) {
+        return res.status(401).json({
+          message:
+            'Authentication required',
+        });
+      }
+
+      const isAdmin =
+        req.user.role === 'ADMIN';
+
+      if (isAdmin) {
+        const loans =
+          await Loan.find({})
+            .sort({
+              createdAt: -1,
+            })
+            .lean();
+
+        return res.json(loans);
+      }
+
+      const requests =
+        await LoanRequest.find(
+          {
+            requesterId:
+              req.user.id,
+          },
+          {
+            _id: 1,
+          }
+        ).lean();
+
+      const requestIds =
+        requests.map(
+          (request) =>
+            request._id
+        );
+
+      const loans =
+        await Loan.find({
+          requestId: {
+            $in: requestIds,
+          },
+        })
+          .sort({
+            createdAt: -1,
+          })
+          .lean();
+
+      return res.json(loans);
+    } catch (error) {
+      console.error(
+        'Get loans error:',
+        error
+      );
+
+      return res.status(500).json({
+        message:
+          'Could not load loans',
+      });
+    }
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| CREATE LOAN REQUEST
+|--------------------------------------------------------------------------
+*/
+
+router.post(
+  '/requests',
+  requireAuth,
+  async (req: AuthRequest, res) => {
+    const parsed = z
+      .object({
+        memberId: z
+          .string()
+          .optional()
+          .nullable(),
+
+        customerId:
+          z.string(),
+
+        requestedEquipmentId:
+          z
+            .string()
+            .optional()
+            .nullable(),
+
+        requestedReturnDate:
+          z
+            .coerce
+            .date()
+            .optional()
+            .nullable(),
+
+        reason:
+          z
+            .string()
+            .max(1000)
+            .optional()
+            .nullable(),
+      })
+      .safeParse(req.body);
+
+    if (!parsed.success) {
+      return res.status(400).json({
+        message:
+          'Invalid request',
+        issues:
+          parsed.error.issues,
+      });
+    }
+
+    try {
+      if (!req.user) {
+        return res.status(401).json({
+          message:
+            'Authentication required',
+        });
+      }
+
+      const {
+        memberId,
+        customerId,
+        requestedEquipmentId,
+        requestedReturnDate,
+        reason,
+      } = parsed.data;
+
+      const memberQuery =
+        req.user.role === 'ADMIN'
+          ? {
+              _id: memberId,
+              isActive: true,
+            }
+          : {
+              employeeId:
+                req.user.employeeId,
+              isActive: true,
+            };
+
+      const [
+        member,
+        customer,
+      ] = await Promise.all([
+        Member.findOne(
+          memberQuery
+        ),
+
+        Customer.findOne({
+          _id: customerId,
+          isActive: true,
+        }),
+      ]);
+
+      if (!member) {
+        return res.status(400).json({
+          message:
+            req.user.role === 'ADMIN'
+              ? 'Requester must be an active member in the database'
+              : 'Your employee member record was not found. Please contact the administrator.',
+        });
+      }
+
+      if (!customer) {
+        return res.status(400).json({
+          message:
+            'Customer not found',
+        });
+      }
+
+      if (
+        req.user.role !== 'ADMIN' &&
+        req.user.employeeId &&
+        member.employeeId !==
+          req.user.employeeId
+      ) {
+        return res.status(403).json({
+          message:
+            'Employees can only submit requests for their own member record',
+        });
+      }
+
+      let equipment: any = null;
+
+      if (requestedEquipmentId) {
+        equipment =
+          await Equipment.findOne({
+            _id:
+              requestedEquipmentId,
+        });
+
+        if (
+          !equipment ||
+          equipment.loanStatus !==
+            'AVAILABLE' ||
+          equipment.operationalStatus !==
+            'OPERATIONAL'
+        ) {
+          return res.status(400).json({
+            message:
+              'Selected equipment is not available',
+          });
+        }
+      }
+
+      const requesterName =
+        req.user.name?.trim() ||
+        member.name?.trim() ||
+        '';
+
+      if (!requesterName) {
+        return res.status(400).json({
+          message:
+            'Requester is required',
+        });
+      }
+
+      /*
+       * -----------------------------------------------------
+       * FIND THE APPROVER FOR THE REQUESTER'S DEPARTMENT
+       * -----------------------------------------------------
+       *
+       * Loan requests are routed only to active APPROVER
+       * administrators whose department matches the employee
+       * department. Matching is case-insensitive and ignores
+       * leading/trailing spaces.
+       *
+       * The employee department is read from the User record,
+       * while the Member record remains the requester/member
+       * record used by the loan workflow.
+       */
+
+      const requesterUser =
+        await User.findById(
+          req.user.id
+        )
+          .select('name email employeeId department role isActive')
+          .lean();
+
+      const requesterDepartment =
+        requesterUser?.department?.trim() ||
+        '';
+
+      if (!requesterDepartment) {
+        return res.status(400).json({
+          message:
+            'Your department is not configured on your employee account. Please contact the administrator.',
+        });
+      }
+
+      const admins =
+        await User.find(
+          {
+            role: 'ADMIN',
+            adminType: 'APPROVER',
+            isActive: true,
+            department: {
+              $regex: `^${requesterDepartment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`,
+              $options: 'i',
+            },
+          },
+          {
+            _id: 1,
+            name: 1,
+            email: 1,
+            adminType: 1,
+            department: 1,
+          }
+        ).lean();
+
+      if (admins.length === 0) {
+        return res.status(400).json({
+          message:
+            `No active APPROVER administrator is assigned to the ${requesterDepartment} department. Please contact the administrator.`,
+        });
+      }
+
+      const request =
+        await LoanRequest.create({
+          requestNumber:
+            await nextNumber(
+              'loanRequest',
+              'LR'
+            ),
+
+          requesterId:
+            req.user.id,
+
+          requester:
+            requesterName,
+
+          memberId:
+            member._id,
+
+          customerId:
+            customer._id,
+
+          requestedEquipmentId:
+            equipment?._id ||
+            null,
+
+          requesterSnapshot: {
+            name:
+              requesterName,
+
+            code:
+              req.user.email ||
+              member.employeeId ||
+              '',
+          },
+
+          customerSnapshot: {
+            name:
+              customer.name,
+
+            code:
+              customer.customerCode,
+          },
+
+          requestedEquipmentSnapshot:
+            equipment
+              ? {
+                  name:
+                    getEquipmentName(
+                      equipment
+                    ),
+
+                  code:
+                    equipment.equipmentCode,
+
+                  serialNumber:
+                    equipment.serialNumber,
+                }
+              : null,
+
+          loanDate:
+            new Date(),
+
+          requestedReturnDate,
+
+          reason:
+            reason || '',
+
+          status:
+            'PENDING',
+        });
+
+      /*
+       * -----------------------------------------------------
+       * INDIVIDUAL ADMIN NOTIFICATIONS
+       * -----------------------------------------------------
+       */
+
+      if (admins.length > 0) {
+        const notifications =
+          admins.map(
+            (admin) => ({
+              userId:
+                admin._id,
+
+              actorId:
+                req.user!.id,
+
+              type:
+                'LOAN_REQUEST',
+
+              title:
+                'New Equipment Loan Request',
+
+              message:
+                `${requesterName} submitted ${request.requestNumber} for ${getEquipmentName(equipment)}.`,
+
+              referenceType:
+                'LOAN_REQUEST',
+
+              referenceId:
+                request.id,
+
+              entityId:
+                equipment?._id ||
+                null,
+
+              metadata: {
+                requestNumber:
+                  request.requestNumber,
+
+                adminType:
+                  admin.adminType ||
+                  null,
+
+                approverDepartment:
+                  admin.department ||
+                  requesterDepartment,
+
+                requester:
+                  requesterName,
+
+                customerName:
+                  customer.name,
+
+                customerCode:
+                  customer.customerCode,
+
+                equipmentName:
+                  equipment
+                    ? getEquipmentName(
+                        equipment
+                      )
+                    : 'Not specified',
+
+                equipmentCode:
+                  equipment
+                    ?.equipmentCode ||
+                  '',
+
+                serialNumber:
+                  equipment
+                    ?.serialNumber ||
+                  '',
+
+                requestedReturnDate:
+                  requestedReturnDate ||
+                  null,
+              },
+
+              isRead:
+                false,
+            })
+          );
+
+        await Notification.insertMany(
+          notifications
+        );
+      }
+
+      /*
+       * -----------------------------------------------------
+       * INDIVIDUAL EMAIL TO EACH ADMIN
+       * -----------------------------------------------------
+       */
+
+      for (const admin of admins) {
+        await sendLoanEmail({
+          to: admin.email,
+
+          subject:
+            `New Loan Request ${request.requestNumber}`,
+
+          title:
+            'New Equipment Loan Request',
+
+          greetingName:
+            admin.name,
+
+          message:
+            `${requesterName} has submitted a new equipment loan request.`,
+
+          details: [
+            {
+              label:
+                'Request Number',
+              value:
+                request.requestNumber,
+            },
+            {
+              label:
+                'Requester',
+              value:
+                requesterName,
+            },
+            {
+              label:
+                'Customer',
+              value:
+                `${customer.name} (${customer.customerCode})`,
+            },
+            {
+              label:
+                'Equipment',
+              value:
+                equipment
+                  ? getEquipmentName(
+                      equipment
+                    )
+                  : 'Not specified',
+            },
+            {
+              label:
+                'Serial Number',
+              value:
+                equipment
+                  ?.serialNumber ||
+                '—',
+            },
+            {
+              label:
+                'Expected Return',
+              value:
+                formatDate(
+                  requestedReturnDate
+                ),
+            },
+            {
+              label:
+                'Reason',
+              value:
+                reason?.trim() ||
+                '—',
+            },
+          ],
+        });
+      }
+
+      await audit({
+        actorId:
+          req.user.id,
+
+        action:
+          'CREATE',
+
+        entityType:
+          'LoanRequest',
+
+        entityId:
+          request.id,
+
+        newValue:
+          request.toObject(),
+      });
+
+      /*
+       * REAL-TIME ADMIN NOTIFICATION
+       */
+
+      for (const admin of admins) {
+        emitUserNotification(
+          admin._id.toString(),
+          {
+            type:
+              'LOAN_REQUEST',
+
+            requestId:
+              request.id,
+
+            title:
+              'New Equipment Loan Request',
+
+            message:
+              `${requesterName} submitted ${request.requestNumber}`,
+          }
+        );
+      }
+
+      emitDashboardChanged();
+
+      return res.status(201).json(
+        request
+      );
+    } catch (error) {
+      console.error(
+        'Create loan request error:',
+        error
+      );
+
+      return res.status(500).json({
+        message:
+          'Could not create loan request',
+      });
+    }
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| APPROVE LOAN REQUEST
+|--------------------------------------------------------------------------
+*/
+
+router.post(
+  '/requests/:id/approve',
+  requireAuth,
+  requireAdmin,
+  async (req: AuthRequest, res) => {
+    try {
+      if (!req.user) {
+        return res.status(401).json({
+          message:
+            'Authentication required',
+        });
+      }
+
+
+      const adminType =
+        await getAdminType(req);
+
+      if (adminType !== 'APPROVER') {
+        return res.status(403).json({
+          message:
+            'Only the designated approval admin can approve loan requests.',
+        });
+      }
+
+      const request =
+        await LoanRequest.findById(
+          req.params.id
+        );
+
+      if (!request) {
+        return res.status(404).json({
+          message:
+            'Request not found',
+        });
+      }
+
+      if (
+        request.status !==
+        'PENDING'
+      ) {
+        return res.status(400).json({
+          message:
+            'Only PENDING requests can be approved',
+        });
+      }
+
+      /*
+       * BACKWARD COMPATIBILITY
+       */
+
+      if (
+        !request.requester?.trim()
+      ) {
+        const [
+          requesterUser,
+          member,
+        ] = await Promise.all([
+          User.findById(
+            request.requesterId
+          ).select(
+            'name email'
+          ),
+
+          Member.findById(
+            request.memberId
+          ).select(
+            'name memberCode employeeId'
+          ),
+        ]);
+
+        const requesterName =
+          request
+            .requesterSnapshot
+            ?.name ||
+          requesterUser?.name ||
+          member?.name ||
+          '';
+
+        if (
+          !requesterName.trim()
+        ) {
+          return res.status(400).json({
+            message:
+              'Requester information is missing from this request',
+          });
+        }
+
+        request.requester =
+          requesterName;
+
+        request.requesterSnapshot =
+          {
+            name:
+              requesterName,
+
+            code:
+              request
+                .requesterSnapshot
+                ?.code ||
+              requesterUser?.email ||
+              member?.memberCode ||
+              member?.employeeId ||
+              '',
+          };
+      }
+
+      const oldStatus =
+        request.status;
+
+      request.status =
+        'APPROVED';
+
+      await request.save();
+
+      /*
+       * GET EMPLOYEE
+       */
+
+      const requesterUser =
+        await User.findById(
+          request.requesterId
+        ).select(
+          'name email employeeId'
+        );
+
+      /*
+       * GET EQUIPMENT/CUSTOMER FOR A SPECIFIC
+       * AND USEFUL NOTIFICATION.
+       */
+
+      const [
+        customer,
+        equipment,
+      ] = await Promise.all([
+        Customer.findById(
+          request.customerId
+        ).lean(),
+
+        request.requestedEquipmentId
+          ? Equipment.findById(
+              request.requestedEquipmentId
+            ).lean()
+          : null,
+      ]);
+
+      const equipmentName =
+        equipment
+          ? getEquipmentName(
+              equipment
+            )
+          : request
+              .requestedEquipmentSnapshot
+              ?.name ||
+            'Equipment';
+
+      /*
+       * DATABASE NOTIFICATION
+       */
+
+      await Notification.create({
+        userId:
+          request.requesterId,
+
+        actorId:
+          req.user.id,
+
+        type:
+          'LOAN_APPROVED',
+
+        title:
+          'Loan Request Approved',
+
+        message:
+          `${request.requestNumber} has been approved.`,
+
+        referenceType:
+          'LOAN_REQUEST',
+
+        referenceId:
+          request.id,
+
+        entityId:
+          equipment?._id ||
+          null,
+
+        metadata: {
+          requestNumber:
+            request.requestNumber,
+
+          requester:
+            request.requester,
+
+          customerName:
+            customer?.name ||
+            request
+              .customerSnapshot
+              ?.name ||
+            '',
+
+          customerCode:
+            customer
+              ?.customerCode ||
+            request
+              .customerSnapshot
+              ?.code ||
+            '',
+
+          equipmentName,
+
+          equipmentCode:
+            equipment
+              ?.equipmentCode ||
+            request
+              .requestedEquipmentSnapshot
+              ?.code ||
+            '',
+
+          serialNumber:
+            equipment
+              ?.serialNumber ||
+            request
+              .requestedEquipmentSnapshot
+              ?.serialNumber ||
+            '',
+
+          expectedReturnDate:
+            request
+              .requestedReturnDate ||
+            null,
+        },
+
+        isRead:
+          false,
+      });
+
+      /*
+       * EMAIL EMPLOYEE
+       */
+
+      await sendLoanEmail({
+        to:
+          requesterUser?.email,
+
+        subject:
+          `Loan Request Approved - ${request.requestNumber}`,
+
+        title:
+          'Loan Request Approved',
+
+        greetingName:
+          requesterUser?.name ||
+          request.requester,
+
+        message:
+          `Your equipment loan request ${request.requestNumber} has been approved by the administration team.`,
+
+        details: [
+          {
+            label:
+              'Request Number',
+            value:
+              request.requestNumber,
+          },
+          {
+            label:
+              'Equipment',
+            value:
+              equipmentName,
+          },
+          {
+            label:
+              'Serial Number',
+            value:
+              equipment
+                ?.serialNumber ||
+              request
+                .requestedEquipmentSnapshot
+                ?.serialNumber ||
+              '—',
+          },
+          {
+            label:
+              'Customer',
+            value:
+              customer?.name ||
+              request
+                .customerSnapshot
+                ?.name ||
+              '—',
+          },
+          {
+            label:
+              'Expected Return',
+            value:
+              formatDate(
+                request
+                  .requestedReturnDate
+              ),
+          },
+        ],
+      });
+
+      await audit({
+        actorId:
+          req.user.id,
+
+        action:
+          'APPROVE',
+
+        entityType:
+          'LoanRequest',
+
+        entityId:
+          request.id,
+
+        oldValue: {
+          status:
+            oldStatus,
+        },
+
+        newValue: {
+          status:
+            request.status,
+        },
+      });
+
+      emitUserNotification(
+        request.requesterId.toString(),
+        {
+          type:
+            'LOAN_APPROVED',
+
+          requestId:
+            request.id,
+
+          title:
+            'Loan Request Approved',
+
+          message:
+            `${request.requestNumber} was approved`,
+        }
+      );
+
+      emitDashboardChanged();
+
+      return res.json(
+        request
+      );
+    } catch (error) {
+      console.error(
+        'Approve loan request error:',
+        error
+      );
+
+      return res.status(500).json({
+        message:
+          'Could not approve loan request',
+      });
+    }
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| REJECT LOAN REQUEST
+|--------------------------------------------------------------------------
+*/
+
+router.post(
+  '/requests/:id/reject',
+  requireAuth,
+  requireAdmin,
+  async (req: AuthRequest, res) => {
+    try {
+      if (!req.user) {
+        return res.status(401).json({
+          message:
+            'Authentication required',
+        });
+      }
+
+
+      const adminType =
+        await getAdminType(req);
+
+      if (adminType !== 'APPROVER') {
+        return res.status(403).json({
+          message:
+            'Only the designated approval admin can reject loan requests.',
+        });
+      }
+
+      const request =
+        await LoanRequest.findById(
+          req.params.id
+        );
+
+      if (!request) {
+        return res.status(404).json({
+          message:
+            'Request not found',
+        });
+      }
+
+      if (
+        request.status !==
+        'PENDING'
+      ) {
+        return res.status(400).json({
+          message:
+            'Only PENDING requests can be rejected',
+        });
+      }
+
+      if (
+        !request.requester?.trim()
+      ) {
+        const [
+          requesterUser,
+          member,
+        ] = await Promise.all([
+          User.findById(
+            request.requesterId
+          ).select(
+            'name email'
+          ),
+
+          Member.findById(
+            request.memberId
+          ).select(
+            'name memberCode employeeId'
+          ),
+        ]);
+
+        const requesterName =
+          request
+            .requesterSnapshot
+            ?.name ||
+          requesterUser?.name ||
+          member?.name ||
+          '';
+
+        if (
+          !requesterName.trim()
+        ) {
+          return res.status(400).json({
+            message:
+              'Requester information is missing from this request',
+          });
+        }
+
+        request.requester =
+          requesterName;
+
+        request.requesterSnapshot =
+          {
+            name:
+              requesterName,
+
+            code:
+              request
+                .requesterSnapshot
+                ?.code ||
+              requesterUser?.email ||
+              member?.memberCode ||
+              member?.employeeId ||
+              '',
+          };
+      }
+
+      const oldStatus =
+        request.status;
+
+      request.status =
+        'REJECTED';
+
+      await request.save();
+
+      const requesterUser =
+        await User.findById(
+          request.requesterId
+        ).select(
+          'name email employeeId'
+        );
+
+      const [
+        customer,
+        equipment,
+      ] = await Promise.all([
+        Customer.findById(
+          request.customerId
+        ).lean(),
+
+        request.requestedEquipmentId
+          ? Equipment.findById(
+              request.requestedEquipmentId
+            ).lean()
+          : null,
+      ]);
+
+      const equipmentName =
+        equipment
+          ? getEquipmentName(
+              equipment
+            )
+          : request
+              .requestedEquipmentSnapshot
+              ?.name ||
+            'Equipment';
+
+      /*
+       * DATABASE NOTIFICATION
+       */
+
+      await Notification.create({
+        userId:
+          request.requesterId,
+
+        actorId:
+          req.user.id,
+
+        type:
+          'LOAN_REJECTED',
+
+        title:
+          'Loan Request Rejected',
+
+        message:
+          `${request.requestNumber} has been rejected.`,
+
+        referenceType:
+          'LOAN_REQUEST',
+
+        referenceId:
+          request.id,
+
+        entityId:
+          equipment?._id ||
+          null,
+
+        metadata: {
+          requestNumber:
+            request.requestNumber,
+
+          requester:
+            request.requester,
+
+          customerName:
+            customer?.name ||
+            request
+              .customerSnapshot
+              ?.name ||
+            '',
+
+          customerCode:
+            customer
+              ?.customerCode ||
+            request
+              .customerSnapshot
+              ?.code ||
+            '',
+
+          equipmentName,
+
+          equipmentCode:
+            equipment
+              ?.equipmentCode ||
+            request
+              .requestedEquipmentSnapshot
+              ?.code ||
+            '',
+
+          serialNumber:
+            equipment
+              ?.serialNumber ||
+            request
+              .requestedEquipmentSnapshot
+              ?.serialNumber ||
+            '',
+        },
+
+        isRead:
+          false,
+      });
+
+      /*
+       * EMAIL EMPLOYEE
+       */
+
+      await sendLoanEmail({
+        to:
+          requesterUser?.email,
+
+        subject:
+          `Loan Request Rejected - ${request.requestNumber}`,
+
+        title:
+          'Loan Request Rejected',
+
+        greetingName:
+          requesterUser?.name ||
+          request.requester,
+
+        message:
+          `Your equipment loan request ${request.requestNumber} has been rejected by the administration team.`,
+
+        details: [
+          {
+            label:
+              'Request Number',
+            value:
+              request.requestNumber,
+          },
+          {
+            label:
+              'Equipment',
+            value:
+              equipmentName,
+          },
+          {
+            label:
+              'Serial Number',
+            value:
+              equipment
+                ?.serialNumber ||
+              request
+                .requestedEquipmentSnapshot
+                ?.serialNumber ||
+              '—',
+          },
+          {
+            label:
+              'Customer',
+            value:
+              customer?.name ||
+              request
+                .customerSnapshot
+                ?.name ||
+              '—',
+          },
+          {
+            label:
+              'Reason',
+            value:
+              request.reason?.trim() ||
+              'No reason was provided.',
+          },
+        ],
+      });
+
+      await audit({
+        actorId:
+          req.user.id,
+
+        action:
+          'REJECT',
+
+        entityType:
+          'LoanRequest',
+
+        entityId:
+          request.id,
+
+        oldValue: {
+          status:
+            oldStatus,
+        },
+
+        newValue: {
+          status:
+            request.status,
+        },
+      });
+
+      emitUserNotification(
+        request.requesterId.toString(),
+        {
+          type:
+            'LOAN_REJECTED',
+
+          requestId:
+            request.id,
+
+          title:
+            'Loan Request Rejected',
+
+          message:
+            `${request.requestNumber} was rejected`,
+        }
+      );
+
+      emitDashboardChanged();
+
+      return res.json(
+        request
+      );
+    } catch (error) {
+      console.error(
+        'Reject loan request error:',
+        error
+      );
+
+      return res.status(500).json({
+        message:
+          'Could not reject loan request',
+      });
+    }
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| ISSUE INSTRUMENT
+|--------------------------------------------------------------------------
+*/
+
+router.post(
+  '/requests/:id/issue',
+  requireAuth,
+  requireAdmin,
+  async (req: AuthRequest, res) => {
+    const parsed = z
+      .object({
+        equipmentId:
+          z.string(),
+
+        expectedReturnDate:
+          z.coerce.date(),
+      })
+      .safeParse(req.body);
+
+    if (!parsed.success) {
+      return res.status(400).json({
+        message:
+          'Invalid issue details',
+
+        issues:
+          parsed.error.issues,
+      });
+    }
+
+    let equipmentId: any =
+      null;
+
+    let loanId: any =
+      null;
+
+    try {
+      if (!req.user) {
+        return res.status(401).json({
+          message:
+            'Authentication required',
+        });
+      }
+
+
+      const adminType =
+        await getAdminType(req);
+
+      if (adminType !== 'ISSUER') {
+        return res.status(403).json({
+          message:
+            'Only the designated issuing admin can issue instruments.',
+        });
+      }
+
+      const request =
+        await LoanRequest.findById(
+          req.params.id
+        );
+
+      if (!request) {
+        return res.status(404).json({
+          message:
+            'Request not found',
+        });
+      }
+
+      if (
+        request.status !==
+        'APPROVED'
+      ) {
+        return res.status(400).json({
+          message:
+            'Only APPROVED requests can be issued',
+        });
+      }
+
+      const [
+        member,
+        customer,
+        requesterUser,
+      ] = await Promise.all([
+        Member.findById(
+          request.memberId
+        ),
+
+        Customer.findById(
+          request.customerId
+        ),
+
+        User.findById(
+          request.requesterId
+        ).select(
+          'name email employeeId'
+        ),
+      ]);
+
+      if (
+        !member ||
+        !customer
+      ) {
+        return res.status(400).json({
+          message:
+            'Member or customer not found',
+        });
+      }
+
+      const requesterName =
+        request.requester?.trim() ||
+        request
+          .requesterSnapshot
+          ?.name
+          ?.trim() ||
+        requesterUser
+          ?.name
+          ?.trim() ||
+        member.name?.trim() ||
+        '';
+
+      if (!requesterName) {
+        return res.status(400).json({
+          message:
+            'Requester is required',
+        });
+      }
+
+      const requesterCode =
+        request
+          .requesterSnapshot
+          ?.code ||
+        requesterUser?.email ||
+        member.memberCode ||
+        member.employeeId ||
+        '';
+
+      if (
+        !request.requester ||
+        !request.requester.trim()
+      ) {
+        request.requester =
+          requesterName;
+
+        request.requesterSnapshot =
+          {
+            name:
+              requesterName,
+
+            code:
+              requesterCode,
+          };
+
+        await request.save();
+      }
+
+      /*
+       * ATOMICALLY RESERVE EQUIPMENT
+       */
+
+      const equipment =
+        await Equipment.findOneAndUpdate(
+          {
+            _id:
+              parsed.data.equipmentId,
+
+            loanStatus:
+              'AVAILABLE',
+
+            operationalStatus:
+              'OPERATIONAL',
+          },
+          {
+            $set: {
+              loanStatus:
+                'ON_LOAN',
+            },
+          },
+          {
+            returnDocument:
+              'after',
+          }
+        );
+
+      if (!equipment) {
+        return res.status(400).json({
+          message:
+            'Equipment is no longer available',
+        });
+      }
+
+      equipmentId =
+        equipment._id;
+
+      const now =
+        new Date();
+
+      const previousRequestStatus =
+        request.status;
+
+      const loanNumber =
+        await nextNumber(
+          'loan',
+          'LOAN'
+        );
+
+      let loan: any;
+
+      try {
+        loan =
+          await Loan.create({
+            loanNumber,
+
+            requestId:
+              request._id,
+
+            equipmentId:
+              equipment._id,
+
+            memberId:
+              member._id,
+
+            customerId:
+              customer._id,
+
+            requester:
+              requesterName,
+
+            equipmentSnapshot:
+              {
+                name:
+                  equipment.material ||
+                  equipment.model ||
+                  'Equipment',
+
+                code:
+                  equipment.equipmentCode,
+
+                serialNumber:
+                  equipment.serialNumber,
+              },
+
+            requesterSnapshot:
+              {
+                name:
+                  requesterName,
+
+                code:
+                  requesterCode,
+              },
+
+            customerSnapshot:
+              {
+                name:
+                  request
+                    .customerSnapshot
+                    ?.name ||
+                  customer.name,
+
+                code:
+                  request
+                    .customerSnapshot
+                    ?.code ||
+                  customer.customerCode ||
+                  '',
+              },
+
+            loanDate:
+              now,
+
+            expectedReturnDate:
+              parsed.data
+                .expectedReturnDate,
+
+            status:
+              'ISSUED',
+
+            issuedBy:
+              req.user.id,
+          });
+      } catch (loanError) {
+        await Equipment.updateOne(
+          {
+            _id:
+              equipment._id,
+          },
+          {
+            $set: {
+              loanStatus:
+                'AVAILABLE',
+
+              updatedAt:
+                new Date(),
+            },
+          }
+        );
+
+        throw loanError;
+      }
+
+      loanId =
+        loan._id;
+
+      try {
+        request.status =
+          'ISSUED';
+
+        request.loanDate =
+          now;
+
+        request.requestedEquipmentId =
+          equipment._id;
+
+        request.requestedEquipmentSnapshot =
+          {
+            name:
+              equipment.material ||
+              equipment.model ||
+              'Equipment',
+
+            code:
+              equipment.equipmentCode,
+
+            serialNumber:
+              equipment.serialNumber,
+          };
+
+        request.requestedReturnDate =
+          parsed.data
+            .expectedReturnDate;
+
+        request.requester =
+          requesterName;
+
+        request.requesterSnapshot =
+          {
+            name:
+              requesterName,
+
+            code:
+              requesterCode,
+          };
+
+        await request.save();
+      } catch (requestError) {
+        await Loan.deleteOne({
+          _id:
+            loan._id,
+        });
+
+        await Equipment.updateOne(
+          {
+            _id:
+              equipment._id,
+          },
+          {
+            $set: {
+              loanStatus:
+                'AVAILABLE',
+
+              updatedAt:
+                new Date(),
+            },
+          }
+        );
+
+        throw requestError;
+      }
+
+      /*
+       * UPDATE EQUIPMENT
+       */
+
+      try {
+        await Equipment.updateOne(
+          {
+            _id:
+              equipment._id,
+          },
+          {
+            $set: {
+              requester:
+                requesterName,
+
+              customer:
+                request
+                  .customerSnapshot
+                  ?.name ||
+                customer.name,
+
+              loanDate:
+                now,
+
+              returnDue:
+                parsed.data
+                  .expectedReturnDate,
+
+              updatedAt:
+                now,
+            },
+          }
+        );
+      } catch (
+        equipmentUpdateError
+      ) {
+        console.error(
+          'Equipment loan details update failed:',
+          equipmentUpdateError
+        );
+      }
+
+      /*
+       * LOAN HISTORY
+       */
+
+      try {
+        await LoanHistory.create({
+          loanId:
+            loan._id,
+
+          action:
+            'ISSUED',
+
+          oldStatus:
+            previousRequestStatus,
+
+          newStatus:
+            'ISSUED',
+
+          performedBy:
+            req.user.id,
+
+          notes:
+            `Instrument issued to ${requesterName}`,
+
+          metadata: {
+            requestId:
+              request._id.toString(),
+
+            equipmentId:
+              equipment._id.toString(),
+
+            loanNumber:
+              loan.loanNumber,
+
+            requester:
+              requesterName,
+          },
+        });
+      } catch (
+        historyError
+      ) {
+        console.error(
+          'Loan history creation failed:',
+          historyError
+        );
+      }
+
+      /*
+       * AUDIT
+       */
+
+      try {
+        await audit({
+          actorId:
+            req.user.id,
+
+          action:
+            'ISSUE_INSTRUMENT',
+
+          entityType:
+            'Loan',
+
+          entityId:
+            loan.id,
+
+          oldValue: {
+            requestStatus:
+              previousRequestStatus,
+
+            equipmentLoanStatus:
+              'AVAILABLE',
+          },
+
+          newValue: {
+            loan:
+              loan.toObject(),
+
+            requestStatus:
+              'ISSUED',
+
+            equipmentLoanStatus:
+              'ON_LOAN',
+
+            requester:
+              requesterName,
+          },
+        });
+      } catch (
+        auditError
+      ) {
+        console.error(
+          'Issue instrument audit failed:',
+          auditError
+        );
+      }
+
+      /*
+       * DATABASE NOTIFICATION
+       */
+
+      try {
+        await Notification.create({
+          userId:
+            request.requesterId,
+
+          actorId:
+            req.user.id,
+
+          type:
+            'INSTRUMENT_ISSUED',
+
+          title:
+            'Instrument Issued',
+
+          message:
+            `${getEquipmentName(equipment)} has been issued to you.`,
+
+          referenceType:
+            'LOAN',
+
+          referenceId:
+            loan.id,
+
+          entityId:
+            equipment._id,
+
+          metadata: {
+            loanNumber:
+              loan.loanNumber,
+
+            requestNumber:
+              request.requestNumber,
+
+            equipmentName:
+              getEquipmentName(
+                equipment
+              ),
+
+            equipmentCode:
+              equipment.equipmentCode ||
+              '',
+
+            serialNumber:
+              equipment.serialNumber,
+
+            customerName:
+              customer.name,
+
+            customerCode:
+              customer.customerCode,
+
+            loanDate:
+              now,
+
+            expectedReturnDate:
+              parsed.data
+                .expectedReturnDate,
+          },
+
+          isRead:
+            false,
+        });
+      } catch (
+        notificationError
+      ) {
+        console.error(
+          'Issue notification failed:',
+          notificationError
+        );
+      }
+
+      /*
+       * EMAIL EMPLOYEE
+       */
+
+      await sendLoanEmail({
+        to:
+          requesterUser?.email,
+
+        subject:
+          `Instrument Issued - ${loan.loanNumber}`,
+
+        title:
+          'Instrument Issued',
+
+        greetingName:
+          requesterUser?.name ||
+          requesterName,
+
+        message:
+          `The requested instrument has been issued to you.`,
+
+        details: [
+          {
+            label:
+              'Loan Number',
+            value:
+              loan.loanNumber,
+          },
+          {
+            label:
+              'Request Number',
+            value:
+              request.requestNumber,
+          },
+          {
+            label:
+              'Equipment',
+            value:
+              getEquipmentName(
+                equipment
+              ),
+          },
+          {
+            label:
+              'Equipment Code',
+            value:
+              equipment
+                .equipmentCode ||
+              '—',
+          },
+          {
+            label:
+              'Serial Number',
+            value:
+              equipment.serialNumber,
+          },
+          {
+            label:
+              'Customer',
+            value:
+              customer.name,
+          },
+          {
+            label:
+              'Loan Date',
+            value:
+              formatDate(now),
+          },
+          {
+            label:
+              'Expected Return',
+            value:
+              formatDate(
+                parsed.data
+                  .expectedReturnDate
+              ),
+          },
+        ],
+      });
+
+      emitUserNotification(
+        request.requesterId.toString(),
+        {
+          type:
+            'INSTRUMENT_ISSUED',
+
+          loanId:
+            loan.id,
+
+          title:
+            'Instrument Issued',
+
+          message:
+            'Your requested instrument has been issued.',
+        }
+      );
+
+      emitDashboardChanged();
+
+      return res.status(201).json(
+        loan
+      );
+    } catch (error: any) {
+      console.error(
+        'Issue instrument error:',
+        error
+      );
+
+      if (
+        equipmentId &&
+        !loanId
+      ) {
+        try {
+          await Equipment.updateOne(
+            {
+              _id:
+                equipmentId,
+
+              loanStatus:
+                'ON_LOAN',
+            },
+            {
+              $set: {
+                loanStatus:
+                  'AVAILABLE',
+
+                updatedAt:
+                  new Date(),
+              },
+            }
+          );
+        } catch (
+          cleanupError
+        ) {
+          console.error(
+            'Equipment cleanup failed:',
+            cleanupError
+          );
+        }
+      }
+
+      return res.status(500).json({
+        message:
+          'Could not issue instrument',
+
+        error:
+          process.env.NODE_ENV !==
+          'production'
+            ? error?.message
+            : undefined,
+      });
+    }
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| DIRECT ISSUE / APPROVE + ISSUE
+|--------------------------------------------------------------------------
+|
+| ANY ACTIVE ISSUER CAN:
+|
+|   PENDING -> APPROVED + ISSUED
+|
+| This does NOT depend on whether an APPROVER exists.
+|
+| The ISSUER is recorded as both approvedBy and issuedBy.
+|
+| The request body is intentionally optional. If the frontend does not
+| send equipmentId / expectedReturnDate, the route uses the equipment and
+| return date already stored on the request. This prevents the
+| "Invalid direct issue details" error when a request already contains
+| those values.
+|
+|--------------------------------------------------------------------------
+*/
+
+router.post(
+  '/requests/:id/direct-issue',
+  requireAuth,
+  requireAdmin,
+  async (req: AuthRequest, res) => {
+    const parsed = z
+      .object({
+        equipmentId:
+          z.string().trim().min(1).optional().nullable(),
+
+        expectedReturnDate:
+          z.coerce.date().optional().nullable(),
+      })
+      .safeParse(req.body || {});
+
+    if (!parsed.success) {
+      return res.status(400).json({
+        message:
+          'Invalid direct issue details',
+        issues:
+          parsed.error.issues,
+      });
+    }
+
+    let reservedEquipmentId: any = null;
+    let createdLoanId: any = null;
+
+    try {
+      if (!req.user) {
+        return res.status(401).json({
+          message:
+            'Authentication required',
+        });
+      }
+
+      const adminType =
+        await getAdminType(req);
+
+      if (adminType !== 'ISSUER') {
+        return res.status(403).json({
+          message:
+            'Only an ISSUER administrator can approve and issue an instrument directly.',
+        });
+      }
+
+      const request =
+        await LoanRequest.findById(
+          req.params.id
+        );
+
+      if (!request) {
+        return res.status(404).json({
+          message:
+            'Request not found',
+        });
+      }
+
+      if (request.status !== 'PENDING') {
+        return res.status(400).json({
+          message:
+            'Only PENDING requests can be directly approved and issued',
+        });
+      }
+
+      const [
+        member,
+        customer,
+        requesterUser,
+      ] = await Promise.all([
+        Member.findById(request.memberId),
+        Customer.findById(request.customerId),
+        User.findById(request.requesterId).select(
+          'name email employeeId'
+        ),
+      ]);
+
+      if (!member || !customer) {
+        return res.status(400).json({
+          message:
+            'Member or customer not found',
+        });
+      }
+
+      const requesterName =
+        request.requester?.trim() ||
+        request.requesterSnapshot?.name?.trim() ||
+        requesterUser?.name?.trim() ||
+        member.name?.trim() ||
+        '';
+
+      if (!requesterName) {
+        return res.status(400).json({
+          message:
+            'Requester is required',
+        });
+      }
+
+      const requesterCode =
+        request.requesterSnapshot?.code ||
+        requesterUser?.email ||
+        member.memberCode ||
+        member.employeeId ||
+        '';
+
+      /*
+       * Prefer values supplied by the ISSUER. Otherwise use the values
+       * already captured when the employee created the request.
+       */
+      const equipmentId =
+        parsed.data.equipmentId ||
+        request.requestedEquipmentId?.toString() ||
+        null;
+
+      const expectedReturnDate =
+        parsed.data.expectedReturnDate ||
+        request.requestedReturnDate ||
+        null;
+
+      if (!equipmentId) {
+        return res.status(400).json({
+          message:
+            'No equipment was selected for this request. Please select an available instrument before issuing it.',
+        });
+      }
+
+      if (!expectedReturnDate) {
+        return res.status(400).json({
+          message:
+            'Expected return date is required.',
+        });
+      }
+
+      if (Number.isNaN(expectedReturnDate.getTime())) {
+        return res.status(400).json({
+          message:
+            'Expected return date is invalid.',
+        });
+      }
+
+      if (expectedReturnDate <= new Date()) {
+        return res.status(400).json({
+          message:
+            'Expected return date must be in the future.',
+        });
+      }
+
+      const approvalBypassReason =
+        'Issuer approved and issued the request directly';
+
+      /*
+       * Reserve only an AVAILABLE + OPERATIONAL instrument.
+       * This protects against two admins issuing the same instrument.
+       */
+      const equipment =
+        await Equipment.findOneAndUpdate(
+          {
+            _id: equipmentId,
+            loanStatus: 'AVAILABLE',
+            operationalStatus: 'OPERATIONAL',
+          },
+          {
+            $set: {
+              loanStatus: 'ON_LOAN',
+            },
+          },
+          {
+            returnDocument: 'after',
+          }
+        );
+
+      if (!equipment) {
+        return res.status(400).json({
+          message:
+            'Equipment is no longer available or is not operational.',
+        });
+      }
+
+      reservedEquipmentId = equipment._id;
+
+      const now = new Date();
+      const previousRequestStatus = request.status;
+
+      const loanNumber =
+        await nextNumber('loan', 'LOAN');
+
+      let loan: any;
+
+      try {
+        loan = await Loan.create({
+          loanNumber,
+          requestId: request._id,
+          equipmentId: equipment._id,
+          memberId: member._id,
+          customerId: customer._id,
+          requester: requesterName,
+
+          equipmentSnapshot: {
+            name:
+              equipment.material ||
+              equipment.model ||
+              'Equipment',
+            code: equipment.equipmentCode,
+            serialNumber: equipment.serialNumber,
+          },
+
+          requesterSnapshot: {
+            name: requesterName,
+            code: requesterCode,
+          },
+
+          customerSnapshot: {
+            name:
+              request.customerSnapshot?.name ||
+              customer.name,
+            code:
+              request.customerSnapshot?.code ||
+              customer.customerCode ||
+              '',
+          },
+
+          loanDate: now,
+          expectedReturnDate,
+          status: 'ISSUED',
+          issuedBy: req.user.id,
+        });
+      } catch (loanError) {
+        await Equipment.updateOne(
+          { _id: equipment._id },
+          {
+            $set: {
+              loanStatus: 'AVAILABLE',
+              updatedAt: new Date(),
+            },
+          }
+        );
+
+        throw loanError;
+      }
+
+      createdLoanId = loan._id;
+
+      try {
+        request.status = 'ISSUED';
+
+        request.approvalMethod =
+          'DIRECT_ISSUE';
+
+        request.approvalBypassReason =
+          approvalBypassReason;
+
+        request.approvedBy =
+          req.user.id;
+
+        request.approvedAt = now;
+
+        request.rejectedBy = null;
+        request.rejectedAt = null;
+
+        request.issuedBy =
+          req.user.id;
+
+        request.issuedAt = now;
+        request.loanDate = now;
+
+        request.requestedEquipmentId =
+          equipment._id;
+
+        request.requestedEquipmentSnapshot = {
+          name:
+            equipment.material ||
+            equipment.model ||
+            'Equipment',
+          code: equipment.equipmentCode,
+          serialNumber: equipment.serialNumber,
+        };
+
+        request.requestedReturnDate =
+          expectedReturnDate;
+
+        request.requester =
+          requesterName;
+
+        request.requesterSnapshot = {
+          name: requesterName,
+          code: requesterCode,
+        };
+
+        await request.save();
+      } catch (requestError) {
+        await Loan.deleteOne({
+          _id: loan._id,
+        });
+
+        await Equipment.updateOne(
+          { _id: equipment._id },
+          {
+            $set: {
+              loanStatus: 'AVAILABLE',
+              updatedAt: new Date(),
+            },
+          }
+        );
+
+        throw requestError;
+      }
+
+      try {
+        await Equipment.updateOne(
+          { _id: equipment._id },
+          {
+            $set: {
+              requester: requesterName,
+              customer:
+                request.customerSnapshot?.name ||
+                customer.name,
+              loanDate: now,
+              returnDue: expectedReturnDate,
+              updatedAt: now,
+            },
+          }
+        );
+      } catch (equipmentUpdateError) {
+        console.error(
+          'Direct issue equipment details update failed:',
+          equipmentUpdateError
+        );
+      }
+
+      try {
+        await LoanHistory.create({
+          loanId: loan._id,
+          action: 'DIRECT_ISSUE',
+          oldStatus: previousRequestStatus,
+          newStatus: 'ISSUED',
+          performedBy: req.user.id,
+          notes:
+            `Instrument approved and directly issued to ${requesterName} by ISSUER ${req.user.name}.`,
+          metadata: {
+            requestId:
+              request._id.toString(),
+            requestNumber:
+              request.requestNumber,
+            equipmentId:
+              equipment._id.toString(),
+            loanNumber:
+              loan.loanNumber,
+            requester:
+              requesterName,
+            approvalMethod:
+              'DIRECT_ISSUE',
+            approvalBypassReason,
+            approvedBy:
+              request.approvedBy,
+            approvedAt:
+              request.approvedAt,
+            issuedBy:
+              request.issuedBy,
+            issuedAt:
+              request.issuedAt,
+            directIssue: true,
+          },
+        });
+      } catch (historyError) {
+        console.error(
+          'Direct issue loan history creation failed:',
+          historyError
+        );
+      }
+
+      try {
+        await audit({
+          actorId: req.user.id,
+          action:
+            'DIRECT_APPROVE_AND_ISSUE',
+          entityType: 'Loan',
+          entityId: loan.id,
+          oldValue: {
+            requestStatus:
+              previousRequestStatus,
+            equipmentLoanStatus:
+              'AVAILABLE',
+            approvalMethod: null,
+            approvedBy: null,
+            approvedAt: null,
+            issuedBy: null,
+            issuedAt: null,
+          },
+          newValue: {
+            loan: loan.toObject(),
+            requestStatus: 'ISSUED',
+            approvalMethod:
+              'DIRECT_ISSUE',
+            approvalBypassReason,
+            approvedBy:
+              request.approvedBy,
+            approvedAt:
+              request.approvedAt,
+            issuedBy:
+              request.issuedBy,
+            issuedAt:
+              request.issuedAt,
+            equipmentLoanStatus:
+              'ON_LOAN',
+            requester:
+              requesterName,
+          },
+        });
+      } catch (auditError) {
+        console.error(
+          'Direct issue audit failed:',
+          auditError
+        );
+      }
+
+      try {
+        await Notification.create({
+          userId:
+            request.requesterId,
+          actorId:
+            req.user.id,
+          type:
+            'INSTRUMENT_ISSUED',
+          title:
+            'Instrument Approved and Issued',
+          message:
+            `${getEquipmentName(equipment)} has been approved and issued to you.`,
+          referenceType:
+            'LOAN',
+          referenceId:
+            loan.id,
+          entityId:
+            equipment._id,
+          metadata: {
+            loanNumber:
+              loan.loanNumber,
+            requestNumber:
+              request.requestNumber,
+            approvedBy:
+              request.approvedBy,
+            approvedAt:
+              request.approvedAt,
+            issuedBy:
+              request.issuedBy,
+            issuedAt:
+              request.issuedAt,
+            approvedByName:
+              req.user.name,
+            issuedByName:
+              req.user.name,
+            approvalMethod:
+              'DIRECT_ISSUE',
+            approvalBypassReason,
+            equipmentName:
+              getEquipmentName(equipment),
+            equipmentCode:
+              equipment.equipmentCode || '',
+            serialNumber:
+              equipment.serialNumber,
+            customerName:
+              customer.name,
+            customerCode:
+              customer.customerCode,
+            loanDate: now,
+            expectedReturnDate,
+          },
+          isRead: false,
+        });
+      } catch (notificationError) {
+        console.error(
+          'Direct issue notification failed:',
+          notificationError
+        );
+      }
+
+      await sendLoanEmail({
+        to: requesterUser?.email,
+        subject:
+          `Instrument Approved and Issued - ${loan.loanNumber}`,
+        title:
+          'Instrument Approved and Issued',
+        greetingName:
+          requesterUser?.name ||
+          requesterName,
+        message:
+          `Your equipment loan request ${request.requestNumber} has been approved and the instrument has been issued directly by ISSUER ${req.user.name}.`,
+        details: [
+          {
+            label: 'Loan Number',
+            value: loan.loanNumber,
+          },
+          {
+            label: 'Request Number',
+            value: request.requestNumber,
+          },
+          {
+            label: 'Equipment',
+            value:
+              getEquipmentName(equipment),
+          },
+          {
+            label: 'Equipment Code',
+            value:
+              equipment.equipmentCode || '—',
+          },
+          {
+            label: 'Serial Number',
+            value:
+              equipment.serialNumber || '—',
+          },
+          {
+            label: 'Customer',
+            value: customer.name,
+          },
+          {
+            label: 'Approved By',
+            value: req.user.name,
+          },
+          {
+            label: 'Issued By',
+            value: req.user.name,
+          },
+          {
+            label: 'Approval Method',
+            value: 'Direct Issue',
+          },
+          {
+            label: 'Loan Date',
+            value: formatDate(now),
+          },
+          {
+            label: 'Expected Return',
+            value:
+              formatDate(expectedReturnDate),
+          },
+        ],
+      });
+
+      emitUserNotification(
+        request.requesterId.toString(),
+        {
+          type:
+            'INSTRUMENT_ISSUED',
+          loanId: loan.id,
+          requestId: request.id,
+          title:
+            'Instrument Approved and Issued',
+          message:
+            'Your requested instrument has been approved and issued directly by an ISSUER.',
+        }
+      );
+
+      emitDashboardChanged();
+
+      return res.status(201).json(loan);
+    } catch (error: any) {
+      console.error(
+        'Direct approve and issue instrument error:',
+        error
+      );
+
+      if (
+        reservedEquipmentId &&
+        !createdLoanId
+      ) {
+        try {
+          await Equipment.updateOne(
+            {
+              _id: reservedEquipmentId,
+              loanStatus: 'ON_LOAN',
+            },
+            {
+              $set: {
+                loanStatus: 'AVAILABLE',
+                updatedAt: new Date(),
+              },
+            }
+          );
+        } catch (cleanupError) {
+          console.error(
+            'Direct issue equipment cleanup failed:',
+            cleanupError
+          );
+        }
+      }
+
+      return res.status(500).json({
+        message:
+          'Could not directly approve and issue instrument',
+        error:
+          process.env.NODE_ENV !== 'production'
+            ? error?.message
+            : undefined,
+      });
+    }
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| RETURN INSTRUMENT
+|--------------------------------------------------------------------------
+*/
+
+router.post(
+  '/:id/return',
+  requireAuth,
+  requireAdmin,
+  async (req: AuthRequest, res) => {
+    try {
+      if (!req.user) {
+        return res.status(401).json({
+          message:
+            'Authentication required',
+        });
+      }
+
+      /*
+       * 1. FIND CURRENT LOAN
+       */
+
+      const loan =
+        await Loan.findById(
+          req.params.id
+        );
+
+      if (
+        !loan ||
+        loan.status !==
+          'ISSUED'
+      ) {
+        return res.status(400).json({
+          message:
+            'Loan is not currently issued',
+        });
+      }
+
+      /*
+       * 2. FIND REQUEST
+       */
+
+      const request =
+        await LoanRequest.findById(
+          loan.requestId
+        );
+
+      if (!request) {
+        return res.status(404).json({
+          message:
+            'Related loan request was not found',
+        });
+      }
+
+      /*
+       * BACKWARD COMPATIBILITY
+       */
+
+      if (
+        !request.requester ||
+        !request.requester.trim()
+      ) {
+        const [
+          requesterUser,
+          member,
+        ] = await Promise.all([
+          User.findById(
+            request.requesterId
+          ).select(
+            'name email'
+          ),
+
+          Member.findById(
+            request.memberId
+          ).select(
+            'name memberCode employeeId'
+          ),
+        ]);
+
+        const requesterName =
+          request
+            .requesterSnapshot
+            ?.name ||
+          requesterUser?.name ||
+          member?.name ||
+          loan.requester ||
+          loan
+            .requesterSnapshot
+            ?.name ||
+          '';
+
+        if (
+          requesterName.trim()
+        ) {
+          request.requester =
+            requesterName;
+
+          request.requesterSnapshot =
+            {
+              name:
+                requesterName,
+
+              code:
+                request
+                  .requesterSnapshot
+                  ?.code ||
+                requesterUser?.email ||
+                member?.memberCode ||
+                member?.employeeId ||
+                '',
+            };
+
+          await request.save();
+        }
+      }
+
+      const oldStatus =
+        loan.status;
+
+      const now =
+        new Date();
+
+      /*
+       * 3. GET RELATED INFORMATION
+       */
+
+      const [
+        requesterUser,
+        customer,
+        equipment,
+      ] = await Promise.all([
+        User.findById(
+          request.requesterId
+        ).select(
+          'name email employeeId'
+        ),
+
+        Customer.findById(
+          loan.customerId
+        ).lean(),
+
+        Equipment.findById(
+          loan.equipmentId
+        ).lean(),
+      ]);
+
+      const requesterName =
+        request.requester ||
+        loan.requester ||
+        request
+          .requesterSnapshot
+          ?.name ||
+        loan
+          .requesterSnapshot
+          ?.name ||
+        requesterUser?.name ||
+        '';
+
+      const equipmentName =
+        equipment
+          ? getEquipmentName(
+              equipment
+            )
+          : loan
+              .equipmentSnapshot
+              ?.name ||
+            'Equipment';
+
+      /*
+       * 4. UPDATE LOAN
+       */
+
+      loan.status =
+        'RETURNED';
+
+      loan.actualReturnDate =
+        now;
+
+      loan.returnedBy =
+        req.user.id;
+
+      await loan.save();
+
+      /*
+       * 5. UPDATE EQUIPMENT
+       */
+
+      const equipmentResult =
+        await Equipment.updateOne(
+          {
+            _id:
+              loan.equipmentId,
+
+            loanStatus:
+              'ON_LOAN',
+          },
+          {
+            $set: {
+              loanStatus:
+                'AVAILABLE',
+
+              requester:
+                '',
+
+              customer:
+                '',
+
+              loanDate:
+                null,
+
+              returnDue:
+                null,
+
+              updatedAt:
+                now,
+            },
+          }
+        );
+
+      if (
+        equipmentResult.modifiedCount ===
+        0
+      ) {
+        console.warn(
+          `Equipment ${loan.equipmentId} was not updated during loan return.`
+        );
+      }
+
+      /*
+       * 6. UPDATE REQUEST
+       */
+
+      await LoanRequest.updateOne(
+        {
+          _id:
+            loan.requestId,
+        },
+        {
+          $set: {
+            status:
+              'RETURNED',
+
+            updatedAt:
+              now,
+          },
+        }
+      );
+
+      /*
+       * 7. LOAN HISTORY
+       */
+
+      try {
+        await LoanHistory.create({
+          loanId:
+            loan._id,
+
+          action:
+            'RETURNED',
+
+          oldStatus:
+            oldStatus,
+
+          newStatus:
+            'RETURNED',
+
+          performedBy:
+            req.user.id,
+
+          notes:
+            'Instrument returned',
+
+          metadata: {
+            requestId:
+              loan.requestId.toString(),
+
+            equipmentId:
+              loan.equipmentId.toString(),
+
+            loanNumber:
+              loan.loanNumber,
+
+            requester:
+              requesterName,
+          },
+        });
+      } catch (
+        historyError
+      ) {
+        console.error(
+          'Return loan history creation failed:',
+          historyError
+        );
+      }
+
+      /*
+       * 8. AUDIT
+       */
+
+      try {
+        await audit({
+          actorId:
+            req.user.id,
+
+          action:
+            'RETURN_INSTRUMENT',
+
+          entityType:
+            'Loan',
+
+          entityId:
+            loan.id,
+
+          oldValue: {
+            status:
+              oldStatus,
+          },
+
+          newValue: {
+            status:
+              'RETURNED',
+
+            equipmentLoanStatus:
+              'AVAILABLE',
+
+            requester:
+              requesterName,
+          },
+        });
+      } catch (
+        auditError
+      ) {
+        console.error(
+          'Return instrument audit failed:',
+          auditError
+        );
+      }
+
+      /*
+       * 9. EMPLOYEE DATABASE NOTIFICATION
+       */
+
+      try {
+        await Notification.create({
+          userId:
+            request.requesterId,
+
+          actorId:
+            req.user.id,
+
+          type:
+            'INSTRUMENT_RETURNED',
+
+          title:
+            'Instrument Returned',
+
+          message:
+            `${equipmentName} has been marked as returned.`,
+
+          referenceType:
+            'LOAN',
+
+          referenceId:
+            loan.id,
+
+          entityId:
+            loan.equipmentId,
+
+          metadata: {
+            loanNumber:
+              loan.loanNumber,
+
+            requestNumber:
+              request.requestNumber,
+
+            equipmentName,
+
+            equipmentCode:
+              equipment
+                ?.equipmentCode ||
+              loan
+                .equipmentSnapshot
+                ?.code ||
+              '',
+
+            serialNumber:
+              equipment
+                ?.serialNumber ||
+              loan
+                .equipmentSnapshot
+                ?.serialNumber ||
+              '',
+
+            customerName:
+              customer?.name ||
+              loan
+                .customerSnapshot
+                ?.name ||
+              '',
+
+            customerCode:
+              customer
+                ?.customerCode ||
+              loan
+                .customerSnapshot
+                ?.code ||
+              '',
+
+            actualReturnDate:
+              now,
+          },
+
+          isRead:
+            false,
+        });
+      } catch (
+        notificationError
+      ) {
+        console.error(
+          'Return notification failed:',
+          notificationError
+        );
+      }
+
+      /*
+       * 10. EMAIL EMPLOYEE
+       */
+
+      await sendLoanEmail({
+        to:
+          requesterUser?.email,
+
+        subject:
+          `Instrument Returned - ${loan.loanNumber}`,
+
+        title:
+          'Instrument Returned',
+
+        greetingName:
+          requesterUser?.name ||
+          requesterName,
+
+        message:
+          `The instrument associated with your loan has been marked as returned.`,
+
+        details: [
+          {
+            label:
+              'Loan Number',
+            value:
+              loan.loanNumber,
+          },
+          {
+            label:
+              'Request Number',
+            value:
+              request.requestNumber,
+          },
+          {
+            label:
+              'Equipment',
+            value:
+              equipmentName,
+          },
+          {
+            label:
+              'Serial Number',
+            value:
+              equipment
+                ?.serialNumber ||
+              loan
+                .equipmentSnapshot
+                ?.serialNumber ||
+              '—',
+          },
+          {
+            label:
+              'Customer',
+            value:
+              customer?.name ||
+              loan
+                .customerSnapshot
+                ?.name ||
+              '—',
+          },
+          {
+            label:
+              'Return Date',
+            value:
+              formatDate(now),
+          },
+        ],
+      });
+
+      /*
+       * 11. INDIVIDUAL ADMIN NOTIFICATIONS
+       *
+       * Admins are also informed that the instrument
+       * has become available again.
+       */
+
+      const admins =
+        await User.find(
+          {
+            role: 'ADMIN',
+            isActive: true,
+          },
+          {
+            _id: 1,
+            name: 1,
+            email: 1,
+          }
+        ).lean();
+
+      /*
+       * Avoid creating another notification for the
+       * same person if the returning employee happens
+       * to have an ADMIN account.
+       */
+
+      const adminRecipients =
+        admins.filter(
+          (admin) =>
+            admin._id.toString() !==
+            request.requesterId.toString()
+        );
+
+      if (
+        adminRecipients.length >
+        0
+      ) {
+        const adminNotifications =
+          adminRecipients.map(
+            (admin) => ({
+              userId:
+                admin._id,
+
+              actorId:
+                req.user!.id,
+
+              type:
+                'INSTRUMENT_RETURNED',
+
+              title:
+                'Instrument Returned',
+
+              message:
+                `${equipmentName} from ${requesterName} has been returned and is available.`,
+
+              referenceType:
+                'LOAN',
+
+              referenceId:
+                loan.id,
+
+              entityId:
+                loan.equipmentId,
+
+              metadata: {
+                loanNumber:
+                  loan.loanNumber,
+
+                requestNumber:
+                  request.requestNumber,
+
+                requester:
+                  requesterName,
+
+                equipmentName,
+
+                equipmentCode:
+                  equipment
+                    ?.equipmentCode ||
+                  '',
+
+                serialNumber:
+                  equipment
+                    ?.serialNumber ||
+                  '',
+
+                customerName:
+                  customer?.name ||
+                  '',
+
+                actualReturnDate:
+                  now,
+              },
+
+              isRead:
+                false,
+            })
+          );
+
+        await Notification.insertMany(
+          adminNotifications
+        );
+      }
+
+      /*
+       * EMAIL EACH ADMIN INDIVIDUALLY
+       */
+
+      for (const admin of adminRecipients) {
+        await sendLoanEmail({
+          to: admin.email,
+
+          subject:
+            `Instrument Returned - ${loan.loanNumber}`,
+
+          title:
+            'Instrument Returned',
+
+          greetingName:
+            admin.name,
+
+          message:
+            `The following instrument has been returned and is now available.`,
+
+          details: [
+            {
+              label:
+                'Loan Number',
+              value:
+                loan.loanNumber,
+            },
+            {
+              label:
+                'Request Number',
+              value:
+                request.requestNumber,
+            },
+            {
+              label:
+                'Requester',
+              value:
+                requesterName,
+            },
+            {
+              label:
+                'Equipment',
+              value:
+                equipmentName,
+            },
+            {
+              label:
+                'Equipment Code',
+              value:
+                equipment
+                  ?.equipmentCode ||
+                '—',
+            },
+            {
+              label:
+                'Serial Number',
+              value:
+                equipment
+                  ?.serialNumber ||
+                '—',
+            },
+            {
+              label:
+                'Customer',
+              value:
+                customer?.name ||
+                loan
+                  .customerSnapshot
+                  ?.name ||
+                '—',
+            },
+            {
+              label:
+                'Return Date',
+              value:
+                formatDate(now),
+            },
+          ],
+        });
+      }
+
+      /*
+       * 12. REAL-TIME EMPLOYEE NOTIFICATION
+       */
+
+      emitUserNotification(
+        request.requesterId.toString(),
+        {
+          type:
+            'INSTRUMENT_RETURNED',
+
+          loanId:
+            loan.id,
+
+          title:
+            'Instrument Returned',
+
+          message:
+            'The instrument was marked as returned.',
+        }
+      );
+
+      /*
+       * REAL-TIME ADMIN NOTIFICATIONS
+       */
+
+      for (const admin of adminRecipients) {
+        emitUserNotification(
+          admin._id.toString(),
+          {
+            type:
+              'INSTRUMENT_RETURNED',
+
+            loanId:
+              loan.id,
+
+            title:
+              'Instrument Returned',
+
+            message:
+              `${equipmentName} has been returned and is available.`,
+          }
+        );
+      }
+
+      emitDashboardChanged();
+
+      return res.json(
+        loan
+      );
+    } catch (error: any) {
+      console.error(
+        'Return instrument error:',
+        error
+      );
+
+      return res.status(500).json({
+        message:
+          'Could not return instrument',
+
+        error:
+          process.env.NODE_ENV !==
+          'production'
+            ? error?.message
+            : undefined,
+      });
+    }
+  }
+);
+
+export default router;
+
